@@ -20,9 +20,15 @@
 package org.apache.hudi.table;
 
 import org.apache.hudi.client.WriteStatus;
+import org.apache.hudi.common.engine.HoodieReaderContext;
+import org.apache.hudi.common.model.CompactionOperation;
 import org.apache.hudi.common.model.HoodieBaseFile;
 import org.apache.hudi.common.model.HoodieRecord;
-import org.apache.hudi.common.model.HoodieRecordPayload;
+import org.apache.hudi.common.table.log.block.HoodieLogBlock;
+import org.apache.hudi.config.HoodieWriteConfig;
+import org.apache.hudi.exception.HoodieNotSupportedException;
+
+import org.apache.hadoop.conf.Configuration;
 
 import java.io.IOException;
 import java.util.Iterator;
@@ -34,10 +40,24 @@ import java.util.Map;
  *
  * @param <T> HoodieRecordPayload type.
  */
-public interface HoodieCompactionHandler<T extends HoodieRecordPayload> {
+public interface HoodieCompactionHandler<T> {
   Iterator<List<WriteStatus>> handleUpdate(String instantTime, String partitionPath, String fileId,
                                            Map<String, HoodieRecord<T>> keyToNewRecords, HoodieBaseFile oldDataFile) throws IOException;
 
   Iterator<List<WriteStatus>> handleInsert(String instantTime, String partitionPath, String fileId,
-                                           Map<String, HoodieRecord<? extends HoodieRecordPayload>> recordMap);
+                                           Map<String, HoodieRecord<?>> recordMap);
+
+  default List<WriteStatus> compactUsingFileGroupReader(String instantTime,
+                                                        CompactionOperation operation,
+                                                        HoodieWriteConfig writeConfig,
+                                                        HoodieReaderContext readerContext,
+                                                        Configuration conf) {
+    throw new HoodieNotSupportedException("This engine does not support file group reader based compaction.");
+  }
+
+  default Iterator<List<WriteStatus>> handleInsertsForLogCompaction(String instantTime, String partitionPath, String fileId,
+                                                           Map<String, HoodieRecord<?>> recordMap,
+                                                           Map<HoodieLogBlock.HeaderMetadataType, String> header) {
+    throw new HoodieNotSupportedException("Operation is not yet supported");
+  }
 }

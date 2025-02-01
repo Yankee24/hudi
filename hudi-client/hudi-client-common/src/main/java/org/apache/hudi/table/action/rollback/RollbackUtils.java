@@ -18,33 +18,27 @@
 
 package org.apache.hudi.table.action.rollback;
 
-import org.apache.hadoop.fs.FileStatus;
 import org.apache.hudi.avro.model.HoodieRollbackPlan;
+import org.apache.hudi.avro.model.HoodieRollbackRequest;
 import org.apache.hudi.common.HoodieRollbackStat;
-import org.apache.hudi.common.engine.HoodieEngineContext;
-import org.apache.hudi.common.fs.FSUtils;
-import org.apache.hudi.common.model.FileSlice;
-import org.apache.hudi.common.model.HoodieCommitMetadata;
-import org.apache.hudi.common.model.HoodieWriteStat;
 import org.apache.hudi.common.table.HoodieTableMetaClient;
 import org.apache.hudi.common.table.log.block.HoodieCommandBlock;
 import org.apache.hudi.common.table.log.block.HoodieLogBlock;
-import org.apache.hudi.common.table.timeline.HoodieActiveTimeline;
 import org.apache.hudi.common.table.timeline.HoodieInstant;
-import org.apache.hudi.common.table.timeline.HoodieTimeline;
 import org.apache.hudi.common.table.timeline.TimelineMetadataUtils;
 import org.apache.hudi.common.util.Option;
-import org.apache.hudi.config.HoodieWriteConfig;
-import org.apache.hudi.table.HoodieTable;
-import org.apache.log4j.LogManager;
-import org.apache.log4j.Logger;
+import org.apache.hudi.common.util.collection.Pair;
+import org.apache.hudi.storage.StoragePathInfo;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Objects;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 
@@ -52,7 +46,7 @@ import static org.apache.hudi.common.util.ValidationUtils.checkArgument;
 
 public class RollbackUtils {
 
-  private static final Logger LOG = LogManager.getLogger(RollbackUtils.class);
+  private static final Logger LOG = LoggerFactory.getLogger(RollbackUtils.class);
 
   /**
    * Get Latest version of Rollback plan corresponding to a clean instant.
@@ -65,7 +59,7 @@ public class RollbackUtils {
   public static HoodieRollbackPlan getRollbackPlan(HoodieTableMetaClient metaClient, HoodieInstant rollbackInstant)
       throws IOException {
     // TODO: add upgrade step if required.
-    final HoodieInstant requested = HoodieTimeline.getRollbackRequestedInstant(rollbackInstant);
+    final HoodieInstant requested = metaClient.getInstantGenerator().getRollbackRequestedInstant(rollbackInstant);
     return TimelineMetadataUtils.deserializeAvroMetadata(
         metaClient.getActiveTimeline().readRollbackInfoAsBytes(requested).get(), HoodieRollbackPlan.class);
   }
@@ -76,7 +70,7 @@ public class RollbackUtils {
     header.put(HoodieLogBlock.HeaderMetadataType.INSTANT_TIME, rollbackInstantTime);
     header.put(HoodieLogBlock.HeaderMetadataType.TARGET_INSTANT_TIME, instantToRollback);
     header.put(HoodieLogBlock.HeaderMetadataType.COMMAND_BLOCK_TYPE,
-        String.valueOf(HoodieCommandBlock.HoodieCommandBlockTypeEnum.ROLLBACK_PREVIOUS_BLOCK.ordinal()));
+        String.valueOf(HoodieCommandBlock.HoodieCommandBlockTypeEnum.ROLLBACK_BLOCK.ordinal()));
     return header;
   }
 
@@ -91,171 +85,109 @@ public class RollbackUtils {
     checkArgument(stat1.getPartitionPath().equals(stat2.getPartitionPath()));
     final List<String> successDeleteFiles = new ArrayList<>();
     final List<String> failedDeleteFiles = new ArrayList<>();
-    final Map<FileStatus, Long> commandBlocksCount = new HashMap<>();
-    final Map<FileStatus, Long> writtenLogFileSizeMap = new HashMap<>();
+    final Map<StoragePathInfo, Long> commandBlocksCount = new HashMap<>();
+    final Map<String, Long> logFilesFromFailedCommit = new HashMap<>();
     Option.ofNullable(stat1.getSuccessDeleteFiles()).ifPresent(successDeleteFiles::addAll);
     Option.ofNullable(stat2.getSuccessDeleteFiles()).ifPresent(successDeleteFiles::addAll);
     Option.ofNullable(stat1.getFailedDeleteFiles()).ifPresent(failedDeleteFiles::addAll);
     Option.ofNullable(stat2.getFailedDeleteFiles()).ifPresent(failedDeleteFiles::addAll);
     Option.ofNullable(stat1.getCommandBlocksCount()).ifPresent(commandBlocksCount::putAll);
     Option.ofNullable(stat2.getCommandBlocksCount()).ifPresent(commandBlocksCount::putAll);
-    return new HoodieRollbackStat(stat1.getPartitionPath(), successDeleteFiles, failedDeleteFiles, commandBlocksCount);
+    Option.ofNullable(stat1.getLogFilesFromFailedCommit()).ifPresent(logFilesFromFailedCommit::putAll);
+    Option.ofNullable(stat2.getLogFilesFromFailedCommit()).ifPresent(logFilesFromFailedCommit::putAll);
+    return new HoodieRollbackStat(stat1.getPartitionPath(), successDeleteFiles, failedDeleteFiles, commandBlocksCount, logFilesFromFailedCommit);
+  }
+
+  static List<HoodieRollbackRequest> groupRollbackRequestsBasedOnFileGroup(List<HoodieRollbackRequest> rollbackRequests) {
+    return groupRollbackRequestsBasedOnFileGroup(rollbackRequests, e -> e,
+        HoodieRollbackRequest::getPartitionPath,
+        HoodieRollbackRequest::getFileId,
+        HoodieRollbackRequest::getLatestBaseInstant,
+        HoodieRollbackRequest::getLogBlocksToBeDeleted,
+        HoodieRollbackRequest::getFilesToBeDeleted);
+  }
+
+  static List<SerializableHoodieRollbackRequest> groupSerializableRollbackRequestsBasedOnFileGroup(
+      List<SerializableHoodieRollbackRequest> rollbackRequests) {
+    return groupRollbackRequestsBasedOnFileGroup(rollbackRequests, SerializableHoodieRollbackRequest::new,
+        SerializableHoodieRollbackRequest::getPartitionPath,
+        SerializableHoodieRollbackRequest::getFileId,
+        SerializableHoodieRollbackRequest::getLatestBaseInstant,
+        SerializableHoodieRollbackRequest::getLogBlocksToBeDeleted,
+        SerializableHoodieRollbackRequest::getFilesToBeDeleted);
   }
 
   /**
-   * Generate all rollback requests that needs rolling back this action without actually performing rollback for COW table type.
-   * @param engineContext instance of {@link HoodieEngineContext} to use.
-   * @param basePath base path of interest.
-   * @return {@link List} of {@link ListingBasedRollbackRequest}s thus collected.
-   */
-  public static List<ListingBasedRollbackRequest> generateRollbackRequestsByListingCOW(HoodieEngineContext engineContext, String basePath) {
-    return FSUtils.getAllPartitionPaths(engineContext, basePath, false, false).stream()
-        .map(ListingBasedRollbackRequest::createRollbackRequestWithDeleteDataAndLogFilesAction)
-        .collect(Collectors.toList());
-  }
-
-  /**
-   * Generate all rollback requests that we need to perform for rolling back this action without actually performing rolling back for MOR table type.
+   * Groups the rollback requests so that each file group has at most two non-empty rollback requests:
+   * one for base file, the other for all log files to be rolled back.
    *
-   * @param instantToRollback Instant to Rollback
-   * @param table instance of {@link HoodieTable} to use.
-   * @param context instance of {@link HoodieEngineContext} to use.
-   * @return list of rollback requests
+   * @param rollbackRequests            input rollback request list
+   * @param createRequestFunc           function to instantiate T object
+   * @param getPartitionPathFunc        function to get partition path from the rollback request
+   * @param getFileIdFunc               function to get file ID from the rollback request
+   * @param getLatestBaseInstant        function to get the latest base instant time from the rollback request
+   * @param getLogBlocksToBeDeletedFunc function to get log blocks to be deleted from the rollback request
+   * @param getFilesToBeDeletedFunc     function to get files to be deleted from the rollback request
+   * @param <T>                         should be either {@link HoodieRollbackRequest} or {@link SerializableHoodieRollbackRequest}
+   * @return a list of rollback requests after grouping
    */
-  public static List<ListingBasedRollbackRequest> generateRollbackRequestsUsingFileListingMOR(HoodieInstant instantToRollback, HoodieTable table, HoodieEngineContext context) throws IOException {
-    String commit = instantToRollback.getTimestamp();
-    HoodieWriteConfig config = table.getConfig();
-    List<String> partitions = FSUtils.getAllPartitionPaths(context, table.getMetaClient().getBasePath(), false, false);
-    if (partitions.isEmpty()) {
-      return new ArrayList<>();
-    }
-    int sparkPartitions = Math.max(Math.min(partitions.size(), config.getRollbackParallelism()), 1);
-    context.setJobStatus(RollbackUtils.class.getSimpleName(), "Generate all rollback requests");
-    return context.flatMap(partitions, partitionPath -> {
-      HoodieActiveTimeline activeTimeline = table.getMetaClient().reloadActiveTimeline();
-      List<ListingBasedRollbackRequest> partitionRollbackRequests = new ArrayList<>();
-      switch (instantToRollback.getAction()) {
-        case HoodieTimeline.COMMIT_ACTION:
-        case HoodieTimeline.REPLACE_COMMIT_ACTION:
-          LOG.info("Rolling back commit action.");
-          partitionRollbackRequests.add(
-              ListingBasedRollbackRequest.createRollbackRequestWithDeleteDataAndLogFilesAction(partitionPath));
-          break;
-        case HoodieTimeline.COMPACTION_ACTION:
-          // If there is no delta commit present after the current commit (if compaction), no action, else we
-          // need to make sure that a compaction commit rollback also deletes any log files written as part of the
-          // succeeding deltacommit.
-          boolean higherDeltaCommits =
-              !activeTimeline.getDeltaCommitTimeline().filterCompletedInstants().findInstantsAfter(commit, 1).empty();
-          if (higherDeltaCommits) {
-            // Rollback of a compaction action with no higher deltacommit means that the compaction is scheduled
-            // and has not yet finished. In this scenario we should delete only the newly created base files
-            // and not corresponding base commit log files created with this as baseCommit since updates would
-            // have been written to the log files.
-            LOG.info("Rolling back compaction. There are higher delta commits. So only deleting data files");
-            partitionRollbackRequests.add(
-                ListingBasedRollbackRequest.createRollbackRequestWithDeleteDataFilesOnlyAction(partitionPath));
-          } else {
-            // No deltacommits present after this compaction commit (inflight or requested). In this case, we
-            // can also delete any log files that were created with this compaction commit as base
-            // commit.
-            LOG.info("Rolling back compaction plan. There are NO higher delta commits. So deleting both data and"
-                + " log files");
-            partitionRollbackRequests.add(
-                ListingBasedRollbackRequest.createRollbackRequestWithDeleteDataAndLogFilesAction(partitionPath));
+  static <T> List<T> groupRollbackRequestsBasedOnFileGroup(List<T> rollbackRequests,
+                                                           Function<HoodieRollbackRequest, T> createRequestFunc,
+                                                           Function<T, String> getPartitionPathFunc,
+                                                           Function<T, String> getFileIdFunc,
+                                                           Function<T, String> getLatestBaseInstant,
+                                                           Function<T, Map<String, Long>> getLogBlocksToBeDeletedFunc,
+                                                           Function<T, List<String>> getFilesToBeDeletedFunc) {
+    // Grouping the rollback requests to a map of pairs of partition and file ID to a list of rollback requests
+    Map<Pair<String, String>, List<T>> requestMap = new HashMap<>();
+    rollbackRequests.forEach(rollbackRequest -> {
+      String partitionPath = getPartitionPathFunc.apply(rollbackRequest);
+      Pair<String, String> partitionFileIdPair =
+          Pair.of(partitionPath != null ? partitionPath : "", getFileIdFunc.apply(rollbackRequest));
+      requestMap.computeIfAbsent(partitionFileIdPair, k -> new ArrayList<>()).add(rollbackRequest);
+    });
+    return requestMap.entrySet().stream().flatMap(entry -> {
+      List<T> rollbackRequestList = entry.getValue();
+      List<T> newRequestList = new ArrayList<>();
+      // Group all log blocks to be deleted in one file group together in a new rollback request
+      Map<String, Long> logBlocksToBeDeleted = new HashMap<>();
+      rollbackRequestList.forEach(rollbackRequest -> {
+        if (!getLogBlocksToBeDeletedFunc.apply(rollbackRequest).isEmpty()) {
+          // For rolling back log blocks by appending rollback log blocks
+          if (!getFilesToBeDeletedFunc.apply(rollbackRequest).isEmpty()) {
+            // This should never happen based on the rollback request generation
+            // As a defensive guard, adding the files to be deleted to a new rollback request
+            LOG.warn("Only one of the following should be non-empty. "
+                    + "Adding the files to be deleted to a new rollback request. "
+                    + "FilesToBeDeleted: {}, LogBlocksToBeDeleted: {}",
+                getFilesToBeDeletedFunc.apply(rollbackRequest),
+                getLogBlocksToBeDeletedFunc.apply(rollbackRequest));
+            String partitionPath = getPartitionPathFunc.apply(rollbackRequest);
+            newRequestList.add(createRequestFunc.apply(HoodieRollbackRequest.newBuilder()
+                .setPartitionPath(partitionPath != null ? partitionPath : "")
+                .setFileId(getFileIdFunc.apply(rollbackRequest))
+                .setLatestBaseInstant(getLatestBaseInstant.apply(rollbackRequest))
+                .setFilesToBeDeleted(getFilesToBeDeletedFunc.apply(rollbackRequest))
+                .setLogBlocksToBeDeleted(Collections.emptyMap())
+                .build()));
           }
-          break;
-        case HoodieTimeline.DELTA_COMMIT_ACTION:
-          // --------------------------------------------------------------------------------------------------
-          // (A) The following cases are possible if index.canIndexLogFiles and/or index.isGlobal
-          // --------------------------------------------------------------------------------------------------
-          // (A.1) Failed first commit - Inserts were written to log files and HoodieWriteStat has no entries. In
-          // this scenario we would want to delete these log files.
-          // (A.2) Failed recurring commit - Inserts/Updates written to log files. In this scenario,
-          // HoodieWriteStat will have the baseCommitTime for the first log file written, add rollback blocks.
-          // (A.3) Rollback triggered for first commit - Inserts were written to the log files but the commit is
-          // being reverted. In this scenario, HoodieWriteStat will be `null` for the attribute prevCommitTime and
-          // and hence will end up deleting these log files. This is done so there are no orphan log files
-          // lying around.
-          // (A.4) Rollback triggered for recurring commits - Inserts/Updates are being rolled back, the actions
-          // taken in this scenario is a combination of (A.2) and (A.3)
-          // ---------------------------------------------------------------------------------------------------
-          // (B) The following cases are possible if !index.canIndexLogFiles and/or !index.isGlobal
-          // ---------------------------------------------------------------------------------------------------
-          // (B.1) Failed first commit - Inserts were written to base files and HoodieWriteStat has no entries.
-          // In this scenario, we delete all the base files written for the failed commit.
-          // (B.2) Failed recurring commits - Inserts were written to base files and updates to log files. In
-          // this scenario, perform (A.1) and for updates written to log files, write rollback blocks.
-          // (B.3) Rollback triggered for first commit - Same as (B.1)
-          // (B.4) Rollback triggered for recurring commits - Same as (B.2) plus we need to delete the log files
-          // as well if the base base file gets deleted.
-          HoodieCommitMetadata commitMetadata = HoodieCommitMetadata.fromBytes(
-              table.getMetaClient().getCommitTimeline().getInstantDetails(instantToRollback).get(),
-              HoodieCommitMetadata.class);
-
-          // In case all data was inserts and the commit failed, delete the file belonging to that commit
-          // We do not know fileIds for inserts (first inserts are either log files or base files),
-          // delete all files for the corresponding failed commit, if present (same as COW)
-          partitionRollbackRequests.add(
-              ListingBasedRollbackRequest.createRollbackRequestWithDeleteDataAndLogFilesAction(partitionPath));
-
-          // append rollback blocks for updates and inserts as A.2 and B.2
-          if (commitMetadata.getPartitionToWriteStats().containsKey(partitionPath)) {
-            partitionRollbackRequests
-                .addAll(generateAppendRollbackBlocksAction(partitionPath, instantToRollback, commitMetadata, table));
-          }
-          break;
-        default:
-          break;
+          logBlocksToBeDeleted.putAll(getLogBlocksToBeDeletedFunc.apply(rollbackRequest));
+        } else {
+          // For base or log files to delete or empty rollback request
+          newRequestList.add(rollbackRequest);
+        }
+      });
+      if (!logBlocksToBeDeleted.isEmpty() && !rollbackRequestList.isEmpty()) {
+        // Generating a new rollback request for all log files in the same file group
+        newRequestList.add(createRequestFunc.apply(HoodieRollbackRequest.newBuilder()
+            .setPartitionPath(entry.getKey().getKey())
+            .setFileId(entry.getKey().getValue())
+            .setLatestBaseInstant(getLatestBaseInstant.apply(rollbackRequestList.get(0)))
+            .setFilesToBeDeleted(Collections.emptyList())
+            .setLogBlocksToBeDeleted(logBlocksToBeDeleted)
+            .build()));
       }
-      return partitionRollbackRequests.stream();
-    }, Math.min(partitions.size(), sparkPartitions)).stream().filter(Objects::nonNull).collect(Collectors.toList());
-  }
-
-  private static List<ListingBasedRollbackRequest> generateAppendRollbackBlocksAction(String partitionPath, HoodieInstant rollbackInstant,
-      HoodieCommitMetadata commitMetadata, HoodieTable table) {
-    checkArgument(rollbackInstant.getAction().equals(HoodieTimeline.DELTA_COMMIT_ACTION));
-
-    // wStat.getPrevCommit() might not give the right commit time in the following
-    // scenario : If a compaction was scheduled, the new commitTime associated with the requested compaction will be
-    // used to write the new log files. In this case, the commit time for the log file is the compaction requested time.
-    // But the index (global) might store the baseCommit of the base and not the requested, hence get the
-    // baseCommit always by listing the file slice
-    // With multi writers, rollbacks could be lazy. and so we need to use getLatestFileSlicesBeforeOrOn() instead of getLatestFileSlices()
-    Map<String, FileSlice> latestFileSlices = table.getSliceView()
-        .getLatestFileSlicesBeforeOrOn(partitionPath, rollbackInstant.getTimestamp(), true)
-        .collect(Collectors.toMap(FileSlice::getFileId, Function.identity()));
-
-    return commitMetadata.getPartitionToWriteStats().get(partitionPath)
-        .stream()
-        .filter(writeStat -> {
-          // Filter out stats without prevCommit since they are all inserts
-          boolean validForRollback = (writeStat != null) && (!writeStat.getPrevCommit().equals(HoodieWriteStat.NULL_COMMIT))
-              && (writeStat.getPrevCommit() != null) && latestFileSlices.containsKey(writeStat.getFileId());
-
-          if (!validForRollback) {
-            return false;
-          }
-
-          FileSlice latestFileSlice = latestFileSlices.get(writeStat.getFileId());
-
-          // For sanity, log-file base-instant time can never be less than base-commit on which we are rolling back
-          checkArgument(
-              HoodieTimeline.compareTimestamps(latestFileSlice.getBaseInstantTime(),
-                  HoodieTimeline.LESSER_THAN_OR_EQUALS, rollbackInstant.getTimestamp()),
-              "Log-file base-instant could not be less than the instant being rolled back");
-
-          // Command block "rolling back" the preceding block {@link HoodieCommandBlockTypeEnum#ROLLBACK_PREVIOUS_BLOCK}
-          // w/in the latest file-slice is appended iff base-instant of the log-file is _strictly_ less
-          // than the instant of the Delta Commit being rolled back. Otherwise, log-file will be cleaned up
-          // in a different branch of the flow.
-          return HoodieTimeline.compareTimestamps(latestFileSlice.getBaseInstantTime(), HoodieTimeline.LESSER_THAN, rollbackInstant.getTimestamp());
-        })
-        .map(writeStat -> {
-          FileSlice latestFileSlice = latestFileSlices.get(writeStat.getFileId());
-          return ListingBasedRollbackRequest.createRollbackRequestWithAppendRollbackBlockAction(partitionPath,
-              writeStat.getFileId(), latestFileSlice.getBaseInstantTime(), writeStat);
-        })
-        .collect(Collectors.toList());
+      return newRequestList.stream();
+    }).collect(Collectors.toList());
   }
 }
